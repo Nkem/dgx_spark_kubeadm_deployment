@@ -60,3 +60,32 @@ models:
     namespace: graphrag
     pvc: vllm-rerank-data
     size: 5Gi
+
+# ── Extra llm-serving Models ─────────────────────────────────────────
+# Additional Ollama models served by charts/llm-serving beside the coding and
+# reasoning entries above. Keyed by model name; every entry needs the download
+# fields (name, tag, source, namespace, pvc, size) and may add the optional
+# chart fields shown below.
+#
+#   name        — short identifier (DNS-1123); resource names are derived from it
+#   tag         — Ollama pull tag
+#   source      — must be "ollama": the llm-serving chart only serves Ollama
+#   namespace   — llm-serving
+#   pvc         — must be "ollama-<name>" so Helm adopts the pre-populated volume
+#   size        — PVC size
+#   storageClass, image, port, numCtx, numParallel, resources
+#               — optional chart overrides; defaults match values.yaml
+#   chart_values — optional free-form mapping merged over the fields above,
+#                  for chart options this playbook does not name explicitly
+#
+# Example:
+#   extra_models:
+#     qwen3-14b:
+#       name: qwen3-14b
+#       tag: "qwen3:14b"
+#       source: ollama
+#       namespace: llm-serving
+#       pvc: ollama-qwen3-14b
+#       size: 20Gi
+#       numCtx: "32768"
+extra_models: {}

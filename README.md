@@ -46,10 +46,12 @@ ansible-playbook -i inventory.ini install-opencode.yml --become
 - `qwen3:8b` — extraction/summarization model for GraphRAG
 - `BAAI/bge-reranker-v2-m3` — reranking model for GraphRAG (HuggingFace)
 
+Any models declared under `extra_models` in `group_vars/k8s.yml` are pulled into their own PVCs by the same flow. See [Serving Additional Models](#serving-additional-models).
+
 **deploy-models.yml** deploys:
 - cert-manager (KServe prerequisite)
 - KServe in RawDeployment mode
-- `llm-serving` Helm chart with one Ollama pod per model
+- `llm-serving` Helm chart with one Ollama pod per model, including any `extra_models` entries merged into the chart values
 
 **deploy-graphrag.yml** deploys:
 - Builds custom container images via `nerdctl` into containerd (`graphrag-code-preprocessor`, `graphrag-lightrag`, `graphrag-orchestrator`, `graphrag-ingest-worker`, `graphrag-ingestion-ui`)
@@ -92,6 +94,40 @@ GraphRAG endpoints (after deploy-graphrag.yml):
 | Code Preprocessor | http://localhost:31490 | http://code-preprocessor.graphrag.svc.cluster.local:8090 |
 
 The orchestrator exposes the same `/v1/chat/completions` interface as the LLM backends, so clients can point at it as a drop-in replacement that adds memory augmentation and model routing.
+
+## Serving Additional Models
+
+The `coding` and `reasoning` entries in `group_vars/k8s.yml` are the pair the rest of the stack assumes. To serve more Ollama models beside them, add entries to `extra_models` in the same file — nothing else has to change:
+
+```yaml
+extra_models:
+  qwen3-14b:
+    name: qwen3-14b
+    tag: "qwen3:14b"
+    source: ollama
+    namespace: llm-serving
+    pvc: ollama-qwen3-14b
+    size: 20Gi
+```
+
+Then re-run the two model playbooks:
+
+```bash
+ansible-playbook -i inventory.ini download-models.yml --become
+ansible-playbook -i inventory.ini deploy-models.yml --become
+```
+
+`download-models.yml` creates the PVC, pulls the weights, and verifies their digests exactly as it does for the base pair. `deploy-models.yml` merges the extra entries into the `llm-serving` chart values (writing them to `/tmp/llm-serving-values.yaml`) and runs one `helm upgrade --install`, so the chart still sees a single release with a single `models` map. Each extra model gets its own `InferenceService`, pod, and `ollama-<name>` PVC.
+
+Constraints worth knowing:
+
+- `pvc` must be `ollama-<name>` and `namespace` must be `llm-serving`; the playbook asserts both, so a typo fails before anything is pulled.
+- `source` must be `ollama` — the chart serves Ollama only. HuggingFace models (`extract`, `embed`, `reranker`) stay in the GraphRAG chart.
+- Each model requests one `nvidia.com/gpu`, and the cluster grants 5 time-slices. The playbook warns when the base pair plus extras exceeds that budget; extra pods then stay `Pending` until a slice frees up.
+- Optional chart fields (`image`, `port`, `numCtx`, `numParallel`, `resources`, `storageClass`) default to the values in `charts/llm-serving/values.yaml`; `chart_values` merges any other chart option verbatim.
+- The base pair is still passed with `--set`, which wins over the values file. Extra models are not exposed as NodePorts; add a Service if you need one from the host.
+
+Unlisted models remain disabled (`enabled: false`) in the chart, and weights on their PVCs are kept — Helm honours `helm.sh/resource-policy: keep` when pruning.
 
 ## Helm Charts
 

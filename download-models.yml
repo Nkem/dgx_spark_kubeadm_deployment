@@ -5,6 +5,9 @@
   vars:
     local_user: "{{ ansible_env.SUDO_USER | default('b') }}"
     kubeconfig: "/home/{{ local_user }}/.kube/config"
+    # Everything that needs weights on disk: the role-keyed models above plus
+    # any additional llm-serving models declared in extra_models.
+    all_models: "{{ models.values() | list + extra_models.values() | list }}"
 
   environment:
     KUBECONFIG: "{{ kubeconfig }}"
@@ -15,7 +18,7 @@
       become: true
       become_user: "{{ local_user }}"
       shell: kubectl create namespace {{ item }} --dry-run=client -o yaml | kubectl apply -f -
-      loop: "{{ models.values() | map(attribute='namespace') | unique | list }}"
+      loop: "{{ all_models | map(attribute='namespace') | unique | list }}"
 
     - name: Create model PVCs
       become: true
@@ -34,18 +37,18 @@
             meta.helm.sh/release-namespace: {{ item.namespace }}
         spec:
           accessModes: ["ReadWriteOnce"]
-          storageClassName: longhorn-models
+          storageClassName: {{ item.storageClass | default('longhorn-models') }}
           resources:
             requests:
               storage: {{ item.size }}
         EOF
-      loop: "{{ models.values() | list }}"
+      loop: "{{ all_models }}"
 
     - name: Wait for PVCs to be bound
       become: true
       become_user: "{{ local_user }}"
       shell: kubectl -n {{ item.namespace }} wait --for=jsonpath='{.status.phase}'=Bound pvc/{{ item.pvc }} --timeout=120s
-      loop: "{{ models.values() | list }}"
+      loop: "{{ all_models }}"
 
     # ── Clean up stale pods from previous runs ────────────────────
     - name: Delete stale check/verify/pull pods
@@ -57,7 +60,7 @@
             | grep "^${prefix}-" \
             | xargs -r kubectl delete pod -n {{ item }} --force --grace-period=0 2>/dev/null || true
         done
-      loop: "{{ models.values() | map(attribute='namespace') | unique | list }}"
+      loop: "{{ all_models | map(attribute='namespace') | unique | list }}"
       changed_when: false
       failed_when: false
 
@@ -72,7 +75,7 @@
             -n {{ item.namespace }}
             --image=busybox:latest
             --overrides='{"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"{{ item.pvc }}"}}],"containers":[{"name":"check","image":"busybox:latest","command":["sh","-c","if find /data/manifests -type f 2>/dev/null | grep -q .; then partials=$(find /data/blobs -name *-partial* 2>/dev/null | wc -l); if [ $partials -gt 0 ]; then echo incomplete; else echo ok; fi; else echo missing; fi"],"volumeMounts":[{"name":"data","mountPath":"/data"}]}]}}'
-          loop: "{{ models.values() | selectattr('source', 'equalto', 'ollama') | list }}"
+          loop: "{{ all_models | selectattr('source', 'equalto', 'ollama') | list }}"
           register: ollama_check
           changed_when: false
           timeout: 120
@@ -99,7 +102,7 @@
             -n {{ item.namespace }}
             --image=busybox:latest
             --overrides='{"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"{{ item.pvc }}"}}],"containers":[{"name":"verify","image":"busybox:latest","command":["sh","-c","manifest=$(find /data/manifests -type f 2>/dev/null | head -1); if [ -z \"$manifest\" ]; then echo SKIP; exit 0; fi; failed=0; for digest in $(grep -oE sha256:[a-f0-9]+ \"$manifest\"); do blob=/data/blobs/$(echo $digest | tr : -); expected=$(echo $digest | cut -d: -f2); if [ ! -f \"$blob\" ]; then echo FAIL:missing:$digest; failed=1; continue; fi; actual=$(sha256sum \"$blob\" | cut -d\" \" -f1); size=$(du -h \"$blob\" | cut -f1); if [ \"$actual\" = \"$expected\" ]; then echo PASS:$size:$digest; else echo FAIL:$size:$digest; failed=1; fi; done; exit $failed"],"volumeMounts":[{"name":"data","mountPath":"/data"}]}]}}'
-          loop: "{{ models.values() | selectattr('source', 'equalto', 'ollama') | list }}"
+          loop: "{{ all_models | selectattr('source', 'equalto', 'ollama') | list }}"
           register: ollama_verify
           timeout: 600
 
@@ -123,7 +126,7 @@
             -n {{ item.namespace }}
             --image=busybox:latest
             --overrides='{"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"{{ item.pvc }}"}}],"containers":[{"name":"check","image":"busybox:latest","command":["sh","-c","if [ -f /data/config.json ]; then incomplete=$(find /data -name *.incomplete 2>/dev/null | wc -l); if [ $incomplete -gt 0 ]; then echo incomplete; else echo ok; fi; else echo missing; fi"],"volumeMounts":[{"name":"data","mountPath":"/data"}]}]}}'
-          loop: "{{ models.values() | selectattr('source', 'equalto', 'huggingface') | list }}"
+          loop: "{{ all_models | selectattr('source', 'equalto', 'huggingface') | list }}"
           register: hf_check
           changed_when: false
           timeout: 120
@@ -150,7 +153,7 @@
             -n {{ item.namespace }}
             --image=busybox:latest
             --overrides='{"spec":{"volumes":[{"name":"data","persistentVolumeClaim":{"claimName":"{{ item.pvc }}"}}],"containers":[{"name":"verify","image":"busybox:latest","command":["sh","-c","if [ ! -f /data/config.json ]; then echo SKIP; exit 0; fi; incomplete=$(find /data -name *.incomplete 2>/dev/null | wc -l); if [ $incomplete -gt 0 ]; then echo FAIL:incomplete; exit 1; fi; for sf in /data/*.safetensors; do [ -f \"$sf\" ] || continue; size=$(du -h \"$sf\" | cut -f1); hash=$(sha256sum \"$sf\" | cut -d\" \" -f1); echo PASS:$size:$(basename $sf):sha256:$hash; done; echo ok"],"volumeMounts":[{"name":"data","mountPath":"/data"}]}]}}'
-          loop: "{{ models.values() | selectattr('source', 'equalto', 'huggingface') | list }}"
+          loop: "{{ all_models | selectattr('source', 'equalto', 'huggingface') | list }}"
           register: hf_verify
           timeout: 600
 
@@ -169,7 +172,7 @@
       become_user: "{{ local_user }}"
       shell: |
         echo "=== Model PVCs ==="
-        {% for ns in models.values() | map(attribute='namespace') | unique %}
+        {% for ns in all_models | map(attribute='namespace') | unique %}
         echo "--- {{ ns }} ---"
         kubectl get pvc -n {{ ns }} --no-headers 2>/dev/null || echo "  (none)"
         echo ""
