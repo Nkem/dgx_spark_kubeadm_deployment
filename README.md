@@ -26,6 +26,10 @@ ansible-playbook -i inventory.ini deploy-graphrag.yml --become
 
 # 5. (Optional) Install OpenCode IDE with local LLM backends
 ansible-playbook -i inventory.ini install-opencode.yml --become
+
+# 6. (Optional) Protect the model volumes and schedule a nightly snapshot
+ansible-playbook -i inventory.ini backup-models.yml --become \
+  -e backup_schedule="0 3 * * *"
 ```
 
 ## What Gets Installed
@@ -38,6 +42,7 @@ ansible-playbook -i inventory.ini install-opencode.yml --become
 - Helm 3
 - Longhorn distributed storage (storage classes: `longhorn`, `longhorn-models`) with multipathd blacklisting to prevent device conflicts
 - A 2-pod GPU sharing validation test
+- (Optional, `-e install_policy_engine=true`) Calico in policy-only mode beside Flannel, so `NetworkPolicy` is enforced
 
 **download-models.yml** pulls models into Longhorn PVCs using temporary containers. Model names, tags, PVC sizes, and download sources are defined in `group_vars/k8s.yml` (single source of truth). Uses block/rescue for resilient downloads (failures log warnings instead of aborting), cleans up stale pods from previous runs, and adds Helm management labels to PVCs:
 - `qwen3-coder-next:q4_K_M` — primary code generation model
@@ -128,6 +133,73 @@ Constraints worth knowing:
 - The base pair is still passed with `--set`, which wins over the values file. Extra models are not exposed as NodePorts; add a Service if you need one from the host.
 
 Unlisted models remain disabled (`enabled: false`) in the chart, and weights on their PVCs are kept — Helm honours `helm.sh/resource-policy: keep` when pruning.
+
+## Backup and Restore
+
+`backup-models.yml` snapshots or backs up every PVC declared in `group_vars/k8s.yml` (`models` and `extra_models`):
+
+```bash
+# On-cluster snapshot of each model volume
+ansible-playbook -i inventory.ini backup-models.yml --become
+
+# Backup to the configured Longhorn backup target (Settings -> backup-target)
+ansible-playbook -i inventory.ini backup-models.yml --become -e backup_action=backup
+
+# Keep taking snapshots every night without a playbook run
+ansible-playbook -i inventory.ini backup-models.yml --become \
+  -e backup_schedule="0 3 * * *"
+```
+
+A snapshot stays on the node and protects against a bad write; a backup needs a backup target and survives losing the node. Neither replaces `download-models.yml`, which is still the way to rebuild a volume from the exact tags.
+
+`backup_schedule` installs a Longhorn `RecurringJob` (`backup_group`, default `dgx-models`) and labels the model volumes into its group, so protection does not depend on someone remembering to run the playbook. `backup_retain` (default `5`) bounds how many are kept.
+
+A restore never overwrites the live volume. It creates a new Longhorn volume from the snapshot or backup, pre-binds a new PV/PVC, and waits for `Bound`:
+
+```bash
+ansible-playbook -i inventory.ini restore-models.yml --become \
+  -e restore_name=dgx-model-ollama-qwen3-coder-next
+```
+
+Useful overrides: `restore_namespace` (default `llm-serving`), `restore_pvc` (default `<source>-restored-<timestamp>`), `restore_size` (default the source PVC's size), `restore_kind` (`auto`, `snapshot` or `backup`). The restored claim can be mounted by a pod to copy files out; delete it when done.
+
+## Multi-Node Clusters
+
+`install-k8s.yml` still builds a single-node cluster. Additional nodes join with `join-k8s.yml`, using an inventory that names the control plane and the workers (`inventory-multinode.ini` is an example):
+
+```ini
+[k8s]
+dgx-control ansible_host=10.0.0.10
+
+[workers]
+dgx-worker-1 ansible_host=10.0.0.11
+```
+
+```bash
+ansible-playbook -i inventory-multinode.ini join-k8s.yml --become
+```
+
+The workers must already have the same prerequisites as the control plane — packages, kernel modules and sysctls, containerd with the NVIDIA runtime, `kubeadm`/`kubelet`/`kubectl`, swap off. `join-k8s.yml` checks for them and fails with what is missing rather than joining a node that cannot run GPU pods. The token is created on the control plane (`control_plane_host`, default `localhost`) and the play waits for every joined node to be `Ready`.
+
+To remove a worker:
+
+```bash
+ansible-playbook -i inventory-multinode.ini leave-k8s.yml --become \
+  -e leave_confirm=true
+```
+
+It drains the node, deletes its Node object, runs `kubeadm reset`, and clears the CNI and kubelet state so the host can rejoin. The control plane is never touched. `leave_drain=false` skips the drain.
+
+## Policy Enforcement
+
+The default CNI is Flannel, which accepts `NetworkPolicy` objects and does not enforce them. Re-run the cluster install with:
+
+```bash
+ansible-playbook -i inventory.ini install-k8s.yml --become \
+  -e install_policy_engine=true
+```
+
+This installs Calico in policy-only mode beside Flannel (`calico_version`, default `v3.29.3`): pod routing stays with Flannel, but Felix enforces policies from then on. Without the flag, `install-k8s.yml` says plainly that policies are declarative only.
 
 ## Helm Charts
 
