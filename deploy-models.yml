@@ -6,6 +6,15 @@
     local_user: "{{ ansible_env.SUDO_USER | default('b') }}"
     kubeconfig: "/home/{{ ansible_env.SUDO_USER | default('b') }}/.kube/config"
     chart_dir: "{{ playbook_dir }}/charts/llm-serving"
+    extra_values_file: "/tmp/llm-serving-values.yaml"
+    default_model_resources:
+      requests:
+        cpu: "4"
+        memory: 1Gi
+      limits:
+        cpu: "10"
+        memory: 120Gi
+        nvidia.com/gpu: "1"
 
   environment:
     KUBECONFIG: "{{ kubeconfig }}"
@@ -109,6 +118,72 @@
       register: kserve_ready
       until: kserve_ready.rc == 0
 
+    # ── Merge extra_models into the chart values ─────────────────
+    - name: Load the llm-serving chart defaults
+      ansible.builtin.include_vars:
+        file: "{{ chart_dir }}/values.yaml"
+        name: llm_chart_defaults
+
+    - name: Reject extra models the chart cannot serve
+      ansible.builtin.assert:
+        that:
+          - item.name != models.coding.name
+          - item.name != models.reasoning.name
+          - item.source == 'ollama'
+          - item.namespace == 'llm-serving'
+          - item.pvc == 'ollama-' ~ item.name
+        fail_msg: >-
+          extra_models entry {{ item.name }} is invalid: it must not collide
+          with the coding or reasoning model, must use source "ollama", must
+          live in the llm-serving namespace, and its pvc must be
+          "ollama-<name>" so Helm adopts the pre-populated volume.
+        quiet: true
+      loop: "{{ extra_models.values() | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Warn when the served set exceeds the GPU time slices
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: {{ 2 + (extra_models | length) }} llm-serving models are
+          enabled, but install-k8s.yml grants 5 GPU time slices. Pods beyond
+          the budget stay Pending.
+      when: (2 + (extra_models | length)) > 5
+
+    - name: Build the extra-model chart entries
+      ansible.builtin.set_fact:
+        extra_chart_models: >-
+          {{ extra_chart_models | default({}) | combine({
+               item.name: {
+                 'enabled': true,
+                 'image': item.image | default('ollama/ollama:latest'),
+                 'ollamaPull': item.tag,
+                 'displayName': item.displayName | default(item.name),
+                 'port': item.port | default(11434),
+                 'numCtx': item.numCtx | default('32768'),
+                 'numParallel': item.numParallel | default('1'),
+                 'resources': item.resources | default(default_model_resources),
+                 'persistence': {
+                   'storageClass': item.storageClass | default('longhorn-models'),
+                   'size': item.size
+                 }
+               } | combine(item.chart_values | default({}), recursive=True)}) }}
+      loop: "{{ extra_models.values() | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Merge the extra models into the chart defaults
+      ansible.builtin.set_fact:
+        serving_models: >-
+          {{ llm_chart_defaults.models
+             | combine(extra_chart_models | default({}), recursive=True) }}
+
+    - name: Write the merged chart values
+      ansible.builtin.copy:
+        dest: "{{ extra_values_file }}"
+        mode: "0644"
+        content: "{{ {'models': serving_models} | to_nice_yaml(indent=2) }}"
+
     # ── Deploy LLM serving chart ──────────────────────────────────
     - name: Deploy llm-serving Helm chart
       become: true
@@ -117,6 +192,7 @@
         helm upgrade --install llm-serving {{ chart_dir }} \
           --namespace llm-serving \
           --create-namespace \
+          --values {{ extra_values_file }} \
           --set models.{{ models.coding.name }}.ollamaPull={{ models.coding.tag }} \
           --set models.{{ models.reasoning.name }}.ollamaPull={{ models.reasoning.tag }} \
           --set models.{{ models.reasoning.name }}.toolsAlias={{ models.reasoning.tools_alias }} \
@@ -155,6 +231,19 @@
       delay: 15
       until: deepseek_verify.rc == 0 and models.reasoning.tools_alias in deepseek_verify.stdout
 
+    - name: Verify extra models are registered
+      become: true
+      become_user: "{{ local_user }}"
+      shell: |
+        kubectl -n {{ item.namespace }} exec deploy/{{ item.name }}-predictor -- ollama list
+      loop: "{{ extra_models.values() | list }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: extra_verify
+      retries: 12
+      delay: 15
+      until: extra_verify.rc == 0 and item.tag in extra_verify.stdout
+
     - name: Show deployment status
       become: true
       become_user: "{{ local_user }}"
@@ -170,10 +259,17 @@
         kubectl -n llm-serving exec deploy/{{ models.coding.name }}-predictor -- ollama list 2>/dev/null || echo "  (not ready)"
         echo "DeepSeek:"
         kubectl -n llm-serving exec deploy/{{ models.reasoning.name }}-predictor -- ollama list 2>/dev/null || echo "  (not ready)"
+        {% for m in extra_models.values() | list %}
+        echo "{{ m.name }}:"
+        kubectl -n {{ m.namespace }} exec deploy/{{ m.name }}-predictor -- ollama list 2>/dev/null || echo "  (not ready)"
+        {% endfor %}
         echo ""
         echo "=== Cluster Endpoints ==="
         echo "Qwen:    {{ models.coding.backend_url }}"
         echo "DeepSeek: {{ models.reasoning.backend_url }}"
+        {% for m in extra_models.values() | list %}
+        echo "{{ m.name }}: http://{{ m.name }}-predictor.{{ m.namespace }}.svc.cluster.local:80"
+        {% endfor %}
       register: status
 
     - name: Display status
