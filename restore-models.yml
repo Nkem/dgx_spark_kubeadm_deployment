@@ -1,0 +1,279 @@
+---
+# Restore a Longhorn snapshot or backup into a NEW volume and PVC.
+#
+#   ansible-playbook -i inventory.ini restore-models.yml --become \
+#     -e restore_name=dgx-model-ollama-qwen3-coder-next
+#
+# Nothing is overwritten: the source volume keeps serving, and the restored
+# copy is a separate claim you can mount, inspect, or delete. That is the only
+# safe shape on a single-node cluster — restoring over a live volume cannot be
+# undone if it was the wrong snapshot.
+#
+# `restore_kind: auto` probes the Snapshot CR first, then the Backup CR.
+- name: Restore a protected volume
+  hosts: k8s
+  become: true
+  vars:
+    local_user: "{{ ansible_env.SUDO_USER | default('b') }}"
+    kubeconfig: "/home/{{ ansible_env.SUDO_USER | default('b') }}/.kube/config"
+    restore_name: ""                    # Snapshot or Backup CR name (required)
+    restore_kind: auto                  # auto | snapshot | backup
+    restore_namespace: llm-serving      # namespace for the restored PVC
+    restore_pvc: ""                     # empty = <source>-restored-<timestamp>
+    restore_size: ""                    # empty = the source PVC's size
+    restore_storage_class: longhorn-models
+    restore_access_mode: ReadWriteOnce
+    restore_wait: true
+    restore_timeout: 30m
+
+  tasks:
+    - name: Require a restore source
+      assert:
+        that:
+          - restore_name | length > 0
+          - restore_kind in ['auto', 'snapshot', 'backup']
+        fail_msg: >-
+          Pass -e restore_name=<snapshot-or-backup>. restore_kind is one of
+          auto, snapshot, backup.
+        quiet: true
+
+    - name: Look for a Longhorn Snapshot with that name
+      command:
+        argv: [kubectl, -n, longhorn-system, get, snapshot, "{{ restore_name }}", -o, json]
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      register: restore_snapshot
+      changed_when: false
+      failed_when: false
+      when: restore_kind in ['auto', 'snapshot']
+
+    - name: Look for a Longhorn Backup with that name
+      command:
+        argv: [kubectl, -n, longhorn-system, get, backup, "{{ restore_name }}", -o, json]
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      register: restore_backup
+      changed_when: false
+      failed_when: false
+      when: restore_kind in ['auto', 'backup']
+
+    - name: Resolve which kind was found
+      set_fact:
+        restore_resolved: >-
+          {{ 'snapshot' if (restore_snapshot.rc | default(1)) == 0
+             else ('backup' if (restore_backup.rc | default(1)) == 0 else '') }}
+
+    - name: Stop when neither exists
+      fail:
+        msg: >-
+          No Longhorn Snapshot or Backup named {{ restore_name }}.
+          Existing snapshots: kubectl -n longhorn-system get snapshot.
+          Existing backups: kubectl -n longhorn-system get backup.
+      when: restore_resolved | length == 0
+
+    - name: Record the source details
+      set_fact:
+        restore_kind: "{{ restore_resolved }}"
+        restore_source_volume: >-
+          {{ (restore_snapshot.stdout | from_json).spec.volume
+             if restore_resolved == 'snapshot'
+             else ((restore_backup.stdout | from_json).status.volumeName | default('')) }}
+        restore_backup_url: >-
+          {{ '' if restore_resolved == 'snapshot'
+             else ((restore_backup.stdout | from_json).status.url | default('')) }}
+        restore_source_pvc: >-
+          {{ (((restore_snapshot.stdout | from_json) if restore_resolved == 'snapshot'
+               else (restore_backup.stdout | from_json)).metadata.labels | default({}))
+             ['dgx-model-pvc'] | default('') }}
+
+    - name: Require a restorable backup URL
+      assert:
+        that:
+          - restore_backup_url | length > 0
+        fail_msg: >-
+          The Backup {{ restore_name }} has no status.url yet, so there is
+          nothing to restore from. Wait for it to reach Completed.
+        quiet: true
+      when: restore_kind == 'backup'
+
+    - name: Resolve the new PVC name
+      set_fact:
+        restore_pvc: >-
+          {{ restore_pvc if restore_pvc | length > 0
+             else ((restore_source_pvc if restore_source_pvc | length > 0
+                    else restore_source_volume) + '-restored-'
+                   + ansible_date_time.iso8601_basic_short) }}
+
+    - name: Find the size of the source PVC
+      command:
+        argv: [kubectl, -n, "{{ restore_namespace }}", get, pvc,
+               "{{ restore_source_pvc }}", -o, "jsonpath={.spec.resources.requests.storage}"]
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      register: restore_source_size
+      changed_when: false
+      failed_when: false
+      when:
+        - restore_size | length == 0
+        - restore_source_pvc | length > 0
+
+    - name: Resolve the restore size
+      set_fact:
+        restore_size_resolved: >-
+          {{ restore_size if restore_size | length > 0
+             else (restore_source_size.stdout | default('') | trim) }}
+
+    - name: Require a size for the new volume
+      assert:
+        that:
+          - restore_size_resolved | length > 0
+        fail_msg: >-
+          The source PVC {{ restore_source_pvc }} is gone and restore_size is
+          empty. Pass -e restore_size=60Gi.
+        quiet: true
+
+    - name: Convert the size to bytes for the Longhorn Volume
+      set_fact:
+        restore_size_bytes: >-
+          {{ (restore_size_resolved | regex_replace('[^0-9]', '') | int)
+             * (1024 ** 3 if restore_size_resolved is search('Gi$')
+                else 1024 ** 2 if restore_size_resolved is search('Mi$')
+                else 1024 ** 3 if restore_size_resolved is search('G$')
+                else 1024 ** 2 if restore_size_resolved is search('M$')
+                else 1) }}
+
+    - name: Refuse to overwrite an existing claim
+      command:
+        argv: [kubectl, -n, "{{ restore_namespace }}", get, pvc, "{{ restore_pvc }}", -o, name]
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      register: restore_existing
+      changed_when: false
+      failed_when: false
+
+    - name: Stop when the target PVC already exists
+      fail:
+        msg: >-
+          PVC {{ restore_pvc }} already exists. Restores never overwrite:
+          delete it first or pass -e restore_pvc=<another-name>.
+      when: restore_existing.rc == 0
+
+    - name: Create the volume, PV and PVC
+      command: kubectl apply -f -
+      args:
+        stdin: |
+          apiVersion: longhorn.io/v1beta2
+          kind: Volume
+          metadata:
+            name: {{ restore_pvc }}
+            namespace: longhorn-system
+            labels:
+              app.kubernetes.io/part-of: dgx-storage
+              dgx-model-pvc: {{ restore_source_pvc | to_json }}
+          spec:
+            size: {{ restore_size_bytes }}
+            numberOfReplicas: 1
+            frontend: blockdev
+            accessMode: rwo
+            storageClassName: {{ restore_storage_class }}
+          {% if restore_kind == 'backup' %}
+            fromBackup: {{ restore_backup_url | to_json }}
+          {% else %}
+            dataSource:
+              sourceType: snapshot
+              sourceVolume: {{ restore_source_volume }}
+              snapshotName: {{ restore_name }}
+          {% endif %}
+          ---
+          apiVersion: v1
+          kind: PersistentVolume
+          metadata:
+            name: {{ restore_pvc }}
+            labels:
+              dgx-model-pvc: {{ restore_source_pvc | to_json }}
+          spec:
+            capacity:
+              storage: {{ restore_size_resolved }}
+            accessModes: ["{{ restore_access_mode }}"]
+            persistentVolumeReclaimPolicy: Retain
+            storageClassName: {{ restore_storage_class }}
+            claimRef:
+              namespace: {{ restore_namespace }}
+              name: {{ restore_pvc }}
+            csi:
+              driver: driver.longhorn.io
+              volumeHandle: {{ restore_pvc }}
+              fsType: ext4
+          ---
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: {{ restore_pvc }}
+            namespace: {{ restore_namespace }}
+            labels:
+              dgx-model-pvc: {{ restore_source_pvc | to_json }}
+          spec:
+            accessModes: ["{{ restore_access_mode }}"]
+            storageClassName: {{ restore_storage_class }}
+            volumeName: {{ restore_pvc }}
+            resources:
+              requests:
+                storage: {{ restore_size_resolved }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      register: restore_apply
+      changed_when: "'created' in restore_apply.stdout or 'configured' in restore_apply.stdout"
+
+    - name: Wait for the restore to bind
+      command:
+        argv: [kubectl, -n, "{{ restore_namespace }}", wait,
+               "pvc/{{ restore_pvc }}", "--for=jsonpath={.status.phase}=Bound",
+               "--timeout={{ restore_timeout }}"]
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      register: restore_wait_run
+      changed_when: false
+      when: restore_wait | bool
+
+    - name: Collect the volume state when the restore did not bind
+      command:
+        argv: [kubectl, -n, longhorn-system, get, volume, "{{ restore_pvc }}", -o, yaml]
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      register: restore_volume_state
+      changed_when: false
+      failed_when: false
+      when:
+        - restore_wait | bool
+        - restore_wait_run.rc != 0
+
+    - name: Fail with the volume state when the restore did not bind
+      fail:
+        msg: |
+          PVC {{ restore_pvc }} did not reach Bound within {{ restore_timeout }}.
+          --- Longhorn Volume ---
+          {{ restore_volume_state.stdout | default('volume not found') }}
+      when:
+        - restore_wait | bool
+        - restore_wait_run.rc != 0
+
+    - name: Show what was restored
+      debug:
+        msg:
+          - "Restored {{ restore_name }} ({{ restore_kind }}) into {{ restore_namespace }}/{{ restore_pvc }}"
+          - "Size {{ restore_size_resolved }}; the source volume is untouched."
+          - "Mount it in a pod, or copy files out, then delete the PVC to reclaim it."

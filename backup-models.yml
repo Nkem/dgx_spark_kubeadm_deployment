@@ -1,0 +1,242 @@
+---
+# Protect the model volumes with Longhorn snapshots and backups.
+#
+#   ansible-playbook -i inventory.ini backup-models.yml --become
+#   ansible-playbook -i inventory.ini backup-models.yml --become -e backup_action=backup
+#   ansible-playbook -i inventory.ini backup-models.yml --become \
+#     -e backup_schedule="0 3 * * *"
+#
+# A snapshot stays on the cluster and protects against a bad write; a backup
+# needs a Longhorn backup target (Settings -> backup-target) and survives
+# losing the node. Neither replaces re-downloading the weights, which is why
+# group_vars/k8s.yml keeps the exact tags.
+#
+# `backup_schedule` installs a RecurringJob and labels the volumes into its
+# group, so protection no longer depends on someone remembering this playbook.
+- name: Protect the model volumes
+  hosts: k8s
+  become: true
+  vars:
+    local_user: "{{ ansible_env.SUDO_USER | default('b') }}"
+    kubeconfig: "/home/{{ ansible_env.SUDO_USER | default('b') }}/.kube/config"
+    backup_action: snapshot       # snapshot | backup
+    backup_prefix: dgx-model
+    backup_schedule: ""           # cron, e.g. "0 3 * * *"; empty = manual only
+    backup_schedule_type: snapshot
+    backup_retain: 5
+    backup_group: dgx-models
+    backup_wait: true
+    backup_pvcs: []               # empty = every PVC in `models` + `extra_models`
+
+  tasks:
+    - name: Select the model PVCs
+      set_fact:
+        backup_entries: >-
+          {{ ((models | dict2items | map(attribute='value')) | list)
+             + ((extra_models | default({}) | dict2items | map(attribute='value')) | list) }}
+
+    - name: Limit the selection to an explicit PVC list
+      set_fact:
+        backup_entries: "{{ backup_entries | selectattr('pvc', 'in', backup_pvcs) | list }}"
+      when: backup_pvcs | length > 0
+
+    - name: Require something to protect
+      assert:
+        that:
+          - backup_entries | length > 0
+        fail_msg: >-
+          No model PVCs matched. group_vars/k8s.yml defines them under `models`
+          and `extra_models`; pass -e '{"backup_pvcs": ["ollama-qwen3-coder-next"]}'
+          to name one directly.
+        quiet: true
+
+    - name: Require a backup target for a backup
+      command: kubectl -n longhorn-system get setting backup-target -o jsonpath={.value}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      register: backup_target
+      changed_when: false
+      when: backup_action == 'backup'
+
+    - name: Stop when a backup has nowhere to go
+      assert:
+        that:
+          - backup_target.stdout | trim | length > 0
+        fail_msg: >-
+          The Longhorn backup target is unset, so a Backup has nowhere to write.
+          Set it (kubectl -n longhorn-system edit setting backup-target) or run
+          with backup_action=snapshot.
+        quiet: true
+      when: backup_action == 'backup'
+
+    - name: Resolve the Longhorn volume for each PVC
+      command:
+        argv: [kubectl, -n, "{{ item.namespace }}", get, pvc, "{{ item.pvc }}",
+               -o, "jsonpath={.spec.volumeName}"]
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      loop: "{{ backup_entries }}"
+      loop_control:
+        label: "{{ item.pvc }}"
+      register: backup_volumes
+      changed_when: false
+      # A model that was never downloaded has no PVC; it is skipped, not fatal.
+      failed_when: false
+
+    - name: Require at least one resolvable volume
+      assert:
+        that:
+          - backup_ready | length > 0
+        fail_msg: >-
+          None of the selected PVCs exist yet. Run download-models.yml first, or
+          pass an existing PVC with -e '{"backup_pvcs": ["<pvc>"]}'.
+        quiet: true
+
+      vars:
+        backup_ready: >-
+          {{ backup_volumes.results | map(attribute='stdout') | map('trim')
+             | select() | list }}
+
+    # ── Schedule ───────────────────────────────────────────────────
+    - name: Create or update the snapshot schedule
+      command: kubectl apply -f -
+      args:
+        stdin: |
+          apiVersion: longhorn.io/v1beta2
+          kind: RecurringJob
+          metadata:
+            name: {{ backup_group }}
+            namespace: longhorn-system
+            labels:
+              app.kubernetes.io/part-of: dgx-storage
+          spec:
+            cron: {{ backup_schedule | to_json }}
+            task: {{ backup_schedule_type }}
+            retain: {{ backup_retain | int }}
+            concurrency: 1
+            groups:
+              - {{ backup_group }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      when: backup_schedule | length > 0
+
+    - name: Put each volume in the schedule's group
+      command:
+        argv: [kubectl, -n, longhorn-system, label, volume, "{{ item.stdout }}",
+               "recurring-job-group.longhorn.io/{{ backup_group }}=enabled", --overwrite]
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      loop: "{{ backup_volumes.results }}"
+      loop_control:
+        label: "{{ item.item.pvc }}"
+      # kubectl label is idempotent; reporting "changed" every run would be noise.
+      changed_when: false
+      when:
+        - backup_schedule | length > 0
+        - item.stdout | trim | length > 0
+
+    - name: Say that protection is manual
+      debug:
+        msg: >-
+          backup_schedule is empty, so only this run's {{ backup_action }}
+          protects the volumes. Set -e backup_schedule="0 3 * * *" to add a
+          Longhorn RecurringJob.
+      when: backup_schedule | length == 0
+
+    # ── One snapshot or backup now ─────────────────────────────────
+    - name: Snapshot each volume
+      command: kubectl apply -f -
+      args:
+        stdin: |
+          apiVersion: longhorn.io/v1beta2
+          kind: Snapshot
+          metadata:
+            name: {{ backup_prefix }}-{{ item.item.pvc }}
+            namespace: longhorn-system
+            labels:
+              app.kubernetes.io/part-of: dgx-storage
+              dgx-model-pvc: {{ item.item.pvc | to_json }}
+          spec:
+            volume: {{ item.stdout }}
+            labels:
+              dgx-model-pvc: {{ item.item.pvc | to_json }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      loop: "{{ backup_volumes.results }}"
+      loop_control:
+        label: "{{ item.item.pvc }}"
+      register: backup_snapshots
+      changed_when: "'created' in backup_snapshots.stdout or 'configured' in backup_snapshots.stdout"
+      when:
+        - backup_action == 'snapshot'
+        - item.stdout | trim | length > 0
+
+    - name: Back each volume up to the configured target
+      command: kubectl apply -f -
+      args:
+        stdin: |
+          apiVersion: longhorn.io/v1beta2
+          kind: Backup
+          metadata:
+            name: {{ backup_prefix }}-{{ item.item.pvc }}
+            namespace: longhorn-system
+            labels:
+              app.kubernetes.io/part-of: dgx-storage
+              dgx-model-pvc: {{ item.item.pvc | to_json }}
+          spec:
+            volume: {{ item.stdout }}
+            labels:
+              dgx-model-pvc: {{ item.item.pvc | to_json }}
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      loop: "{{ backup_volumes.results }}"
+      loop_control:
+        label: "{{ item.item.pvc }}"
+      register: backup_runs
+      changed_when: "'created' in backup_runs.stdout or 'configured' in backup_runs.stdout"
+      when:
+        - backup_action == 'backup'
+        - item.stdout | trim | length > 0
+
+    - name: Wait for the backups to complete
+      command:
+        argv: [kubectl, -n, longhorn-system, get, backup,
+               "{{ backup_prefix }}-{{ item.item.pvc }}",
+               -o, "jsonpath={.status.state}"]
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      loop: "{{ backup_volumes.results }}"
+      loop_control:
+        label: "{{ item.item.pvc }}"
+      register: backup_state
+      changed_when: false
+      until: backup_state.stdout | trim == 'Completed'
+      retries: 60
+      delay: 10
+      when:
+        - backup_action == 'backup'
+        - backup_wait | bool
+        - item.stdout | trim | length > 0
+
+    - name: Show what was protected
+      debug:
+        msg:
+          - "{{ backup_action }} {{ backup_prefix }}: {{ backup_entries | map(attribute='pvc') | join(', ') }}"
+          - >-
+            Restore into a new PVC with:
+            ansible-playbook -i inventory.ini restore-models.yml --become
+            -e restore_name={{ backup_prefix }}-<pvc>
