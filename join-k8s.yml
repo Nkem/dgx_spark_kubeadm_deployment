@@ -1,0 +1,109 @@
+---
+# Join prepared worker nodes to the control plane.
+#
+#   ansible-playbook -i inventory-multinode.ini join-k8s.yml --become
+#
+# The workers must already have the same prerequisites as the control plane:
+# containerd (with the NVIDIA runtime configured the same way), kubeadm,
+# kubelet and kubectl, swap off, and the kernel modules/sysctls from
+# install-k8s.yml. This playbook checks for them instead of guessing — a
+# half-prepared worker would join and then fail to run GPU workloads.
+#
+# `control_plane_host` is the inventory name the token is read from; the
+# default `localhost` matches inventory.ini.
+- name: Join the workers
+  hosts: workers
+  become: true
+  gather_facts: true
+  vars:
+    cri_socket: "unix:///run/containerd/containerd.sock"
+    control_plane_host: localhost
+  tasks:
+    - name: Require at least one worker
+      assert:
+        that:
+          - groups['workers'] | default([]) | length > 0
+        fail_msg: >-
+          No hosts in a `workers` group. Add one to inventory-multinode.ini,
+          for example:
+            [workers]
+            dgx-worker-1 ansible_host=10.0.0.11
+        quiet: true
+
+    - name: Require kubeadm, kubelet and containerd on the worker
+      command: "{{ item }}"
+      loop:
+        - kubeadm version -o short
+        - kubelet --version
+        - systemctl is-active containerd
+      register: worker_prereqs
+      changed_when: false
+      failed_when: false
+
+    - name: Explain what a worker is missing
+      fail:
+        msg: >-
+          The worker is missing kubeadm, kubelet or a running containerd. Run
+          the prerequisites section of install-k8s.yml on this host first
+          (packages, kernel modules, sysctls, containerd + NVIDIA runtime,
+          swap off); joining an unprepared node produces a Ready node that
+          cannot run GPU pods.
+      when: worker_prereqs.results | selectattr('rc', 'ne', 0) | list | length > 0
+
+    - name: Read a join command from the control plane
+      command: kubeadm token create --print-join-command
+      delegate_to: "{{ control_plane_host }}"
+      run_once: true
+      register: join_token
+      changed_when: false
+
+    - name: Join the cluster
+      command: "{{ join_token.stdout | trim }} --cri-socket {{ cri_socket }}"
+      register: join_run
+      changed_when: "'This node has joined the cluster' in join_run.stdout"
+
+    - name: Record the node name for the readiness check
+      set_fact:
+        node_name: >-
+          {{ hostvars[inventory_hostname].node_name | default(ansible_hostname) }}
+
+    - name: Show the join result
+      debug:
+        msg: "{{ join_run.stdout_lines }}"
+
+- name: Wait for every node to be Ready
+  hosts: k8s
+  become: true
+  gather_facts: true
+  vars:
+    local_user: "{{ ansible_env.SUDO_USER | default('b') }}"
+    kubeconfig: "/home/{{ ansible_env.SUDO_USER | default('b') }}/.kube/config"
+  tasks:
+    - name: Wait for each joined node
+      command:
+        argv: [kubectl, wait, "node/{{ item }}", --for=condition=Ready, --timeout=600s]
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      loop: "{{ groups['workers'] | default([]) | map('extract', hostvars, 'node_name') | list }}"
+      loop_control:
+        label: "{{ item }}"
+      register: join_ready
+      changed_when: false
+      retries: 30
+      delay: 10
+      until: join_ready.rc == 0
+
+    - name: Show the cluster nodes
+      command: kubectl get nodes -o wide
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      become: true
+      become_user: "{{ local_user }}"
+      register: join_nodes
+      changed_when: false
+
+    - name: Report the joined nodes
+      debug:
+        var: join_nodes.stdout_lines

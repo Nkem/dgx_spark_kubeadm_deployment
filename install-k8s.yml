@@ -9,6 +9,11 @@
     local_user: "{{ ansible_env.SUDO_USER | default('b') }}"
     kubeconfig: "/home/{{ ansible_env.SUDO_USER | default('b') }}/.kube/config"
     arch: "{{ 'arm64' if ansible_architecture == 'aarch64' else 'amd64' }}"
+    # Flannel accepts NetworkPolicy objects and does not enforce them. Setting
+    # this installs Calico in policy-only mode beside Flannel, so policies
+    # become real without replacing the pod network or rebooting the node.
+    install_policy_engine: false
+    calico_version: "v3.29.3"
 
   tasks:
     # ── Detect existing cluster ───────────────────────────────────
@@ -246,6 +251,42 @@
       command: kubectl apply -f https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml
       environment:
         KUBECONFIG: "{{ kubeconfig }}"
+
+    # ── Policy enforcement (optional, beside Flannel) ──────────────
+    - name: Install Calico in policy-only mode
+      become: true
+      become_user: "{{ local_user }}"
+      command: >-
+        kubectl apply -f
+        https://raw.githubusercontent.com/projectcalico/calico/{{ calico_version }}/manifests/calico-policy-only.yaml
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: calico_apply
+      changed_when: "'created' in calico_apply.stdout or 'configured' in calico_apply.stdout"
+      when: install_policy_engine | bool
+
+    - name: Wait for the Calico policy controllers
+      become: true
+      become_user: "{{ local_user }}"
+      command: >-
+        kubectl -n kube-system rollout status deployment/calico-kube-controllers
+        --timeout=300s
+      environment:
+        KUBECONFIG: "{{ kubeconfig }}"
+      register: calico_rollout
+      changed_when: false
+      retries: 3
+      delay: 15
+      until: calico_rollout.rc == 0
+      when: install_policy_engine | bool
+
+    - name: Say that NetworkPolicy is declarative only
+      debug:
+        msg: >-
+          Flannel does not enforce NetworkPolicy. Any policy applied to this
+          cluster is recorded but inert. Re-run with
+          -e install_policy_engine=true to install Calico in policy-only mode.
+      when: not (install_policy_engine | bool)
 
     # ── Untaint control plane (worker + control-plane) ─────────────
     - name: Remove control-plane taint for single-node cluster
